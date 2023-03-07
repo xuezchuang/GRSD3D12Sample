@@ -24,10 +24,16 @@
     <ClCompile Include="6-MultiThreadWithMsgWait.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
+    <ClCompile Include="GameTimer.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\WindowsCommons\DDSTextureLoader12.h">
       <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="GameTimer.h">
+      <Filter>源文件</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>

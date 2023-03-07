@@ -150,9 +150,11 @@
   <ItemGroup>
     <ClCompile Include="..\WindowsCommons\DDSTextureLoader12.cpp" />
     <ClCompile Include="6-MultiThreadWithMsgWait.cpp" />
+    <ClCompile Include="GameTimer.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\WindowsCommons\DDSTextureLoader12.h" />
+    <ClInclude Include="GameTimer.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="Shader\TextureCube.hlsl">

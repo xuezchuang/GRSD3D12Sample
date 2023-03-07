@@ -26,6 +26,12 @@ using namespace DirectX;
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "d3dcompiler.lib")
 
+#define GRS_USEPRINTF() TCHAR pBuf[1024] = {};TCHAR pszOutput[1024] = {};
+#define GRS_PRINTF(...) \
+    StringCchPrintf(pBuf,1024,__VA_ARGS__);\
+	StringCchPrintf(pszOutput,1024,_T("【ID:% 8u】：%s"),::GetCurrentThreadId(),pBuf);\
+	OutputDebugString(pszOutput);
+
 #define GRS_WND_CLASS_NAME _T("GRS Game Window Class")
 #define GRS_WND_TITLE	_T("GRS DirectX12 Multithreaded Rendering Sample")
 
@@ -149,7 +155,7 @@ struct ST_GRS_THREAD_PARAMS
 	DWORD								dwMainThreadID;
 	HANDLE								hMainThread;
 	HANDLE								hRunEvent;
-	HANDLE								hEventRenderOver;
+	//HANDLE								hEventRenderOver;
 	UINT								nCurrentFrameIndex;//当前渲染后缓冲序号
 	ULONGLONG							nStartTime;		   //当前帧开始时间
 	ULONGLONG							nCurrentTime;	   //当前时间
@@ -161,6 +167,8 @@ struct ST_GRS_THREAD_PARAMS
 	ID3D12GraphicsCommandList*			pICmdList;
 	ID3D12RootSignature*				pIRS;
 	ID3D12PipelineState*				pIPSO;
+
+	UINT								m_nPassNO;
 };
 
 int									g_iWndWidth = 1024;
@@ -198,10 +206,17 @@ ComPtr<ID3D12DescriptorHeap>		g_pIDSVHeap;				//深度缓冲描述符堆
 
 TCHAR								g_pszAppPath[MAX_PATH] = {};
 
+
+// 线程池管理内核同步对象
+HANDLE									g_hEventPassOver;
+HANDLE									g_hSemaphore;
+SYNCHRONIZATION_BARRIER					g_stCPUThdBarrier = {};
+
 UINT __stdcall		RenderThread(void* pParam);
 LRESULT CALLBACK    WndProc(HWND, UINT, WPARAM, LPARAM);
 BOOL				LoadMeshVertex(const CHAR*pszMeshFileName, UINT&nVertexCnt, ST_GRS_VERTEX*&ppVertex, UINT*&ppIndices);
 
+#include "GameTimer.h"
 int APIENTRY _tWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR    lpCmdLine, int nCmdShow)
 {
 	::CoInitialize(nullptr);  //for WIC & COM
@@ -304,6 +319,29 @@ int APIENTRY _tWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR    l
 			}
 		}
 
+		// 创建用于CPU子渲染线程池的同步对象
+		{
+			// 通知线程池启动渲染的信标量，初始信标个数为0，最大信标个数即线程池线程个数
+			g_hSemaphore = ::CreateSemaphore(nullptr, 0, g_nMaxThread, nullptr);
+			if (!g_hSemaphore)
+			{
+				throw CGRSCOMException(HRESULT_FROM_WIN32(GetLastError()));
+			}
+
+			// 线程池Pass渲染结束事件句柄
+			g_hEventPassOver = ::CreateEvent(nullptr, FALSE, FALSE, nullptr);
+			if (!g_hEventPassOver)
+			{
+				throw CGRSCOMException(HRESULT_FROM_WIN32(GetLastError()));
+			}
+
+			// 创建CPU线程屏障对象，允许进入的线程数即线程池线程个数
+			if (!InitializeSynchronizationBarrier(&g_stCPUThdBarrier, g_nMaxThread, -1))
+			{
+				throw CGRSCOMException(HRESULT_FROM_WIN32(GetLastError()));
+			}
+		}
+
 		//2、打开显示子系统的调试支持
 		{
 #if defined(_DEBUG)
@@ -336,7 +374,7 @@ int APIENTRY _tWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR    l
 					continue;
 				}
 
-				GRS_THROW_IF_FAILED(D3D12CreateDevice(pIAdapter1.Get(), D3D_FEATURE_LEVEL_12_1, IID_PPV_ARGS(&pID3D12Device4)));
+				GRS_THROW_IF_FAILED(D3D12CreateDevice(pIAdapter1.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&pID3D12Device4)));
 				GRS_THROW_IF_FAILED(pID3D12Device4->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE
 					, &stArchitecture, sizeof(D3D12_FEATURE_DATA_ARCHITECTURE)));
 
@@ -661,6 +699,8 @@ int APIENTRY _tWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR    l
 			{
 				g_stThreadParams[i].nIndex = i;		//记录序号
 
+				g_stThreadParams[i].m_nPassNO = 0;
+
 				//创建每个线程需要的命令列表和复制命令队列
 				GRS_THROW_IF_FAILED(pID3D12Device4->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT
 					, IID_PPV_ARGS(&g_stThreadParams[i].pICmdAlloc)));
@@ -673,12 +713,12 @@ int APIENTRY _tWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR    l
 				g_stThreadParams[i].dwMainThreadID = ::GetCurrentThreadId();
 				g_stThreadParams[i].hMainThread = ::GetCurrentThread();
 				g_stThreadParams[i].hRunEvent = ::CreateEvent(nullptr, FALSE, FALSE, nullptr);
-				g_stThreadParams[i].hEventRenderOver = ::CreateEvent(nullptr, FALSE, FALSE, nullptr);
+				//g_stThreadParams[i].hEventRenderOver = ::CreateEvent(nullptr, FALSE, FALSE, nullptr);
 				g_stThreadParams[i].pID3D12Device4 = pID3D12Device4.Get();
 				g_stThreadParams[i].pIRS = pIRootSignature.Get();
 				g_stThreadParams[i].pIPSO = pIPSOSphere.Get();
 
-				arHWaited.Add(g_stThreadParams[i].hEventRenderOver); //添加到被等待队列里
+				//arHWaited.Add(g_stThreadParams[i].hEventRenderOver); //添加到被等待队列里
 
 				//以暂停方式创建线程
 				g_stThreadParams[i].hThisThread = (HANDLE)_beginthreadex(nullptr,
@@ -715,6 +755,9 @@ int APIENTRY _tWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR    l
 			}
 		}
 
+		arHWaited.RemoveAll();
+		arHWaited.Add(g_hEventPassOver);
+
 		D3D12_RESOURCE_BARRIER stBeginResBarrier = {};
 		D3D12_RESOURCE_BARRIER stEndResBarrier = {};
 		{
@@ -734,7 +777,7 @@ int APIENTRY _tWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR    l
 			stEndResBarrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 		}
 
-		UINT nStates = 0; //初始状态为0
+		//UINT nStates = 0; //初始状态为0
 		DWORD dwRet = 0;
 		DWORD dwWaitCnt = 0;
 		CAtlArray<ID3D12CommandList*> arCmdList;
@@ -746,127 +789,136 @@ int APIENTRY _tWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR    l
 		ULONGLONG n64tmCurrent = n64tmFrameStart;
 		//计算旋转角度需要的变量
 		double dModelRotationYAngle = 0.0f;
-
+		WCHAR str[MAX_PATH] = {};
 		//起始的时候关闭一下两个命令列表，因为我们在开始渲染的时候都需要先reset它们，为了防止报错故先Close
 		GRS_THROW_IF_FAILED(pICmdListPre->Close());
 		GRS_THROW_IF_FAILED(pICmdListPost->Close());
 
-		SetTimer(hWnd, WM_USER + 100, 1, nullptr); //这句为了保证MsgWaitForMultipleObjects 在 wait for all 为True时 能够及时返回
+		//SetTimer(hWnd, WM_USER + 100, 1, nullptr); //这句为了保证MsgWaitForMultipleObjects 在 wait for all 为True时 能够及时返回
 
 		ShowWindow(hWnd, nCmdShow);
 		UpdateWindow(hWnd);
-		
+
+		UINT					nMaxPass = 2; //假设一帧渲染需要至少5遍渲染（5 Pass），可以根据你的渲染手法（technology）来动态调整
+		UINT					nPassNO = 0;    //当前渲染Pass的序号
+
+		GRS_USEPRINTF();
 		//13、开始消息循环，并在其中不断渲染
+		static float timeElapsed = 0.0f;
+		static int frameCnt = 0;
+		GameTimer gTimer;
+		gTimer.Reset();
 		while (!bExit)
-		{//注意这里我们调整了消息循环，将等待时间设置为0，同时将定时性的渲染，改成了每次循环都渲染
-		 //特别注意这次等待与之前不同
-			//主线程进入等待
+		{
 			dwWaitCnt = static_cast<DWORD>(arHWaited.GetCount());
-			dwRet = ::MsgWaitForMultipleObjects( dwWaitCnt ,arHWaited.GetData(), TRUE,INFINITE, QS_ALLINPUT);
+			dwRet = ::MsgWaitForMultipleObjects( dwWaitCnt ,arHWaited.GetData(), FALSE,INFINITE, QS_ALLINPUT);
 			dwRet -= WAIT_OBJECT_0;
 
-			if( 0 == dwRet )
+			switch (dwRet)
 			{
-				switch (nStates)
+			case 0:
+			{
+				if (nPassNO == 0)
 				{
-				case 0://状态0，表示等到各子线程加载资源完毕，此时执行一次命令列表完成各子线程要求的资源上传的第二个Copy命令
-				{
-
 					arCmdList.RemoveAll();
-					//执行命令列表
 					arCmdList.Add(g_stThreadParams[g_nThdSphere].pICmdList);
 					arCmdList.Add(g_stThreadParams[g_nThdCube].pICmdList);
 					arCmdList.Add(g_stThreadParams[g_nThdPlane].pICmdList);
-
 					pIMainCmdQueue->ExecuteCommandLists(static_cast<UINT>(arCmdList.GetCount()), arCmdList.GetData());
-
-					//---------------------------------------------------------------------------------------------
 					//开始同步GPU与CPU的执行，先记录围栏标记值
 					n64fence = n64FenceValue;
 					GRS_THROW_IF_FAILED(pIMainCmdQueue->Signal(pIFence.Get(), n64fence));
 					n64FenceValue++;
 					GRS_THROW_IF_FAILED(pIFence->SetEventOnCompletion(n64fence, hEventFence));
-
-					nStates = 1;
-
 					arHWaited.RemoveAll();
 					arHWaited.Add(hEventFence);
+					//ReleaseSemaphore(g_hSemaphore, g_nMaxThread, nullptr);
+					++nPassNO; //递增到下一遍渲染
 				}
-				break;
-				case 1:// 状态1 等到命令队列执行结束（也即CPU等到GPU执行结束），开始新一轮渲染
+				else if (nPassNO < nMaxPass)
 				{
-					GRS_THROW_IF_FAILED(pICmdAllocPre->Reset());
-					GRS_THROW_IF_FAILED(pICmdListPre->Reset(pICmdAllocPre.Get(), pIPSOSphere.Get()));
-
-					GRS_THROW_IF_FAILED(pICmdAllocPost->Reset());
-					GRS_THROW_IF_FAILED(pICmdListPost->Reset(pICmdAllocPost.Get(), pIPSOSphere.Get()));
-
 					nCurrentFrameIndex = pISwapChain3->GetCurrentBackBufferIndex();
-					//计算全局的Matrix
-					{
-						//关于时间的基本运算都放在了主线程中
-						//真实的引擎或程序中建议时间值也作为一个每帧更新的参数从主线程获取并传给各子线程
-						n64tmCurrent = ::GetTickCount();
-						//计算旋转的角度：旋转角度(弧度) = 时间(秒) * 角速度(弧度/秒)
-						//下面这句代码相当于经典游戏消息循环中的OnUpdate函数中需要做的事情
-						dModelRotationYAngle += ((n64tmCurrent - n64tmFrameStart) / 1000.0f) * g_fPalstance;
-
-						//旋转角度是2PI周期的倍数，去掉周期数，只留下相对0弧度开始的小于2PI的弧度即可
-						if (dModelRotationYAngle > XM_2PI)
-						{
-							dModelRotationYAngle = fmod(dModelRotationYAngle, XM_2PI);
-						}
-
-						//计算 World 矩阵 这里是个旋转矩阵
-						XMStoreFloat4x4(&g_mxWorld, XMMatrixRotationY(static_cast<float>(dModelRotationYAngle)));
-						//计算 视矩阵 view * 裁剪矩阵 projection
-						XMStoreFloat4x4(&g_mxVP
-							, XMMatrixMultiply(XMMatrixLookAtLH(XMLoadFloat3(&g_f3EyePos)
-								, XMLoadFloat3(&g_f3LockAt)
-								, XMLoadFloat3(&g_f3HeapUp))
-								, XMMatrixPerspectiveFovLH(XM_PIDIV4
-									, (FLOAT)g_iWndWidth / (FLOAT)g_iWndHeight, 0.1f, 1000.0f)));
-					}
-
-					//渲染前处理
-					{
-						stBeginResBarrier.Transition.pResource = g_pIARenderTargets[nCurrentFrameIndex].Get();
-						pICmdListPre->ResourceBarrier(1, &stBeginResBarrier);
-
-						//偏移描述符指针到指定帧缓冲视图位置
-						D3D12_CPU_DESCRIPTOR_HANDLE stRTVHandle = g_pIRTVHeap->GetCPUDescriptorHandleForHeapStart();
-						stRTVHandle.ptr += ( nCurrentFrameIndex * g_nRTVDescriptorSize);
-						D3D12_CPU_DESCRIPTOR_HANDLE stDSVHandle = g_pIDSVHeap->GetCPUDescriptorHandleForHeapStart();
-						//设置渲染目标
-						pICmdListPre->OMSetRenderTargets(1, &stRTVHandle, FALSE, &stDSVHandle);
-
-						pICmdListPre->RSSetViewports(1, &g_stViewPort);
-						pICmdListPre->RSSetScissorRects(1, &g_stScissorRect);
-						
-						pICmdListPre->ClearRenderTargetView(stRTVHandle, faClearColor, 0, nullptr);
-						pICmdListPre->ClearDepthStencilView(stDSVHandle, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
-					}
-
-					nStates = 2;
-
-					arHWaited.RemoveAll();
-					arHWaited.Add(g_stThreadParams[g_nThdSphere].hEventRenderOver);
-					arHWaited.Add(g_stThreadParams[g_nThdCube].hEventRenderOver);
-					arHWaited.Add(g_stThreadParams[g_nThdPlane].hEventRenderOver);
+					
 
 					//通知各线程开始渲染
 					for (int i = 0; i < g_nMaxThread; i++)
 					{
+						//设定子线程渲染Pass序号
+						g_stThreadParams[i].m_nPassNO = nPassNO;
 						g_stThreadParams[i].nCurrentFrameIndex = nCurrentFrameIndex;
 						g_stThreadParams[i].nStartTime = n64tmFrameStart;
 						g_stThreadParams[i].nCurrentTime = n64tmCurrent;
-
-						SetEvent(g_stThreadParams[i].hRunEvent);
 					}
+					{
+						GRS_THROW_IF_FAILED(pICmdAllocPre->Reset());
+						GRS_THROW_IF_FAILED(pICmdListPre->Reset(pICmdAllocPre.Get(), pIPSOSphere.Get()));
 
+						GRS_THROW_IF_FAILED(pICmdAllocPost->Reset());
+						GRS_THROW_IF_FAILED(pICmdListPost->Reset(pICmdAllocPost.Get(), pIPSOSphere.Get()));
+
+						nCurrentFrameIndex = pISwapChain3->GetCurrentBackBufferIndex();
+						//计算全局的Matrix
+						{
+							//关于时间的基本运算都放在了主线程中
+							//真实的引擎或程序中建议时间值也作为一个每帧更新的参数从主线程获取并传给各子线程
+							n64tmCurrent = ::GetTickCount();
+							//计算旋转的角度：旋转角度(弧度) = 时间(秒) * 角速度(弧度/秒)
+							//下面这句代码相当于经典游戏消息循环中的OnUpdate函数中需要做的事情
+							dModelRotationYAngle += ((n64tmCurrent - n64tmFrameStart) / 1000.0f) * g_fPalstance;
+
+							//旋转角度是2PI周期的倍数，去掉周期数，只留下相对0弧度开始的小于2PI的弧度即可
+							if (dModelRotationYAngle > XM_2PI)
+							{
+								dModelRotationYAngle = fmod(dModelRotationYAngle, XM_2PI);
+							}
+
+							//计算 World 矩阵 这里是个旋转矩阵
+							XMStoreFloat4x4(&g_mxWorld, XMMatrixRotationY(static_cast<float>(dModelRotationYAngle)));
+							//计算 视矩阵 view * 裁剪矩阵 projection
+							XMStoreFloat4x4(&g_mxVP
+								, XMMatrixMultiply(XMMatrixLookAtLH(XMLoadFloat3(&g_f3EyePos)
+									, XMLoadFloat3(&g_f3LockAt)
+									, XMLoadFloat3(&g_f3HeapUp))
+									, XMMatrixPerspectiveFovLH(XM_PIDIV4
+										, (FLOAT)g_iWndWidth / (FLOAT)g_iWndHeight, 0.1f, 1000.0f)));
+						}
+
+						//渲染前处理
+						{
+							stBeginResBarrier.Transition.pResource = g_pIARenderTargets[nCurrentFrameIndex].Get();
+							pICmdListPre->ResourceBarrier(1, &stBeginResBarrier);
+
+							//偏移描述符指针到指定帧缓冲视图位置
+							D3D12_CPU_DESCRIPTOR_HANDLE stRTVHandle = g_pIRTVHeap->GetCPUDescriptorHandleForHeapStart();
+							stRTVHandle.ptr += (nCurrentFrameIndex * g_nRTVDescriptorSize);
+							D3D12_CPU_DESCRIPTOR_HANDLE stDSVHandle = g_pIDSVHeap->GetCPUDescriptorHandleForHeapStart();
+							//设置渲染目标
+							pICmdListPre->OMSetRenderTargets(1, &stRTVHandle, FALSE, &stDSVHandle);
+
+							pICmdListPre->RSSetViewports(1, &g_stViewPort);
+							pICmdListPre->RSSetScissorRects(1, &g_stScissorRect);
+
+							pICmdListPre->ClearRenderTargetView(stRTVHandle, faClearColor, 0, nullptr);
+							pICmdListPre->ClearDepthStencilView(stDSVHandle, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+						}
+					}
+					++nPassNO; //递增到下一遍渲染
+					// 释放信标量至最大子线程数，相当于通知所有子线程开始渲染运行
+					ReleaseSemaphore(g_hSemaphore, g_nMaxThread, nullptr);
+					arHWaited.RemoveAll();
+					arHWaited.Add(g_hEventPassOver);
+					gTimer.Tick();
+					frameCnt++;
+					// Compute averages over one second period.
+					if ((gTimer.TotalTime() - timeElapsed) >= 1.0f)
+					{
+						float mspf = 1000.0f / frameCnt;
+						GRS_PRINTF(_T("fps:%d , mspf:%.2f\n"), frameCnt, mspf);
+						frameCnt = 0;
+						timeElapsed += 1.0f;
+					}
 				}
-				break;
-				case 2:// 状态2 表示所有的渲染命令列表都记录完成了，开始后处理和执行命令列表
+				else
 				{
 					stEndResBarrier.Transition.pResource = g_pIARenderTargets[nCurrentFrameIndex].Get();
 					pICmdListPost->ResourceBarrier(1, &stEndResBarrier);
@@ -893,25 +945,19 @@ int APIENTRY _tWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR    l
 					GRS_THROW_IF_FAILED(pIMainCmdQueue->Signal(pIFence.Get(), n64fence));
 					n64FenceValue++;
 					GRS_THROW_IF_FAILED(pIFence->SetEventOnCompletion(n64fence, hEventFence));
-
-					nStates = 1;
-
 					arHWaited.RemoveAll();
 					arHWaited.Add(hEventFence);
-
+					//nStates = 1;
+					nPassNO = 1;
 					//更新下帧开始时间为上一帧开始时间
 					n64tmFrameStart = n64tmCurrent;
 				}
-				break;
-				default:// 不可能的情况，但为了避免讨厌的编译警告或意外情况保留这个default
-				{
-					bExit = TRUE;
-				}
-				break;
-				}
-
+			}
+			break;
+			case 1:
+			{
 				//处理消息
-				while( ::PeekMessage(&msg, NULL, 0, 0, PM_REMOVE | PM_NOYIELD) )
+				while (::PeekMessage(&msg, NULL, 0, 0, PM_REMOVE | PM_NOYIELD))
 				{
 					if (WM_QUIT != msg.message)
 					{
@@ -924,23 +970,24 @@ int APIENTRY _tWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR    l
 					}
 				}
 			}
-			else
+			break;
+			default:
 			{
 
-
 			}
-		
-			//---------------------------------------------------------------------------------------------
-			//检测一下线程的活动情况，如果有线程已经退出了，就退出循环
+			break;
+			}
+
 			dwRet = WaitForMultipleObjects(static_cast<DWORD>(arHSubThread.GetCount()), arHSubThread.GetData(), FALSE, 0);
 			dwRet -= WAIT_OBJECT_0;
 			if (dwRet >= 0 && dwRet < g_nMaxThread)
 			{
 				bExit = TRUE;
 			}
+
 		}
 
-		KillTimer(hWnd, WM_USER + 100);
+		//KillTimer(hWnd, WM_USER + 100);
 	}
 	catch (CGRSCOMException& e)
 	{//发生了COM异常
@@ -962,7 +1009,7 @@ int APIENTRY _tWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR    l
 		for (int i = 0; i < g_nMaxThread; i++)
 		{
 			::CloseHandle(g_stThreadParams[i].hThisThread);
-			::CloseHandle(g_stThreadParams[i].hEventRenderOver);
+			//::CloseHandle(g_stThreadParams[i].hEventRenderOver);
 			g_stThreadParams[i].pICmdList->Release();
 			g_stThreadParams[i].pICmdAlloc->Release();
 		}
@@ -1121,7 +1168,8 @@ UINT __stdcall RenderThread(void* pParam)
 
 			// 第二次Copy！
 			if (stDefaultResDesc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
-			{// Buffer 一次性复制就可以了，因为没有行对齐和行大小不一致的问题，Buffer中行数就是1
+			{
+				// Buffer 一次性复制就可以了，因为没有行对齐和行大小不一致的问题，Buffer中行数就是1
 				pThdPms->pICmdList->CopyBufferRegion(
 					pITexture.Get(), 0, pITextureUpload.Get(), pLayouts[0].Offset, pLayouts[0].Footprint.Width);
 			}
@@ -1154,7 +1202,7 @@ UINT __stdcall RenderThread(void* pParam)
 
 			//同步
 			pThdPms->pICmdList->ResourceBarrier(1, &stTransResBarrier);
-
+			// 
 			// 创建描述符堆
 			D3D12_DESCRIPTOR_HEAP_DESC stSRVCBVHPDesc = {};
 			stSRVCBVHPDesc.NumDescriptors = 2; // 1 CBV + 1 SRV
@@ -1179,6 +1227,7 @@ UINT __stdcall RenderThread(void* pParam)
 				, stCbvSrvHandle);
 		}
 
+		{}
 		//2、创建Sample
 		{
 			D3D12_DESCRIPTOR_HEAP_DESC stSamplerHeapDesc = {};
@@ -1319,12 +1368,21 @@ UINT __stdcall RenderThread(void* pParam)
 			D3D12_CPU_DESCRIPTOR_HANDLE stCbvSrvHandle = pISRVCBVHp->GetCPUDescriptorHandleForHeapStart();
 			pThdPms->pID3D12Device4->CreateConstantBufferView(&cbvDesc, stCbvSrvHandle);
 		}
+		GRS_USEPRINTF();
+		TCHAR pszPreSpace[] = _T("  ");
+		GRS_PRINTF(_T("%s子线程【%d】开始进入渲染循环\n"), pszPreSpace, pThdPms->nIndex);
 
 		//5、设置事件对象 通知并切回主线程 完成资源的第二个Copy命令
 		{
 			GRS_THROW_IF_FAILED(pThdPms->pICmdList->Close());
 			//第一次通知主线程本线程加载资源完毕
-			::SetEvent(pThdPms->hEventRenderOver); // 设置信号，通知主线程本线程资源加载完毕
+			//::SetEvent(pThdPms->hEventRenderOver); // 设置信号，通知主线程本线程资源加载完毕
+			if (EnterSynchronizationBarrier(&g_stCPUThdBarrier, 0))
+			{
+				//GRS_PRINTF(_T("%s子线程【%d】：通知主线程完成第【%d】遍渲染\n"), pszPreSpace, pThdPms->nIndex, pThdPms->m_nPassNO);
+
+				SetEvent(g_hEventPassOver);
+			}
 		}
 
 		// 仅用于球体跳动物理特效的变量
@@ -1336,15 +1394,22 @@ UINT __stdcall RenderThread(void* pParam)
 		BOOL  bQuit = FALSE;
 		MSG   msg = {};
 
+
+
 		//6、渲染循环
 		while (!bQuit)
 		{
-			// 等待主线程通知开始渲染，同时仅接收主线程Post过来的消息，目前就是为了等待WM_QUIT消息
-			dwRet = ::MsgWaitForMultipleObjects(1, &pThdPms->hRunEvent, FALSE, INFINITE, QS_ALLPOSTMESSAGE);
+			dwRet = ::MsgWaitForMultipleObjects(1, &g_hSemaphore, FALSE, INFINITE, QS_ALLPOSTMESSAGE);
+			
+			//WCHAR str[MAX_PATH] = {};
+			//StringCchPrintfW(str, MAX_PATH, _T("Current:%d \n"), dwRet);
+			//OutputDebugString(str);
 			switch (dwRet - WAIT_OBJECT_0)
 			{
 			case 0:
 			{
+				//GRS_PRINTF(_T("%s子线程【%d】执行第【%d】遍渲染：OnThreadRender()\n"), pszPreSpace, pThdPms->nIndex, pThdPms->m_nPassNO);
+
 				//命令分配器先Reset一下，刚才已经执行过了一个复制纹理的命令
 				GRS_THROW_IF_FAILED(pThdPms->pICmdAlloc->Reset());
 				//Reset命令列表，并重新指定命令分配器和PSO对象
@@ -1421,13 +1486,14 @@ UINT __stdcall RenderThread(void* pParam)
 
 					//Draw Call！！！
 					pThdPms->pICmdList->DrawIndexedInstanced(nIndexCnt, 1, 0, 0, 0);
+					GRS_THROW_IF_FAILED(pThdPms->pICmdList->Close());
 				}
 
-				//完成渲染（即关闭命令列表，并设置同步对象通知主线程开始执行）
+				if (EnterSynchronizationBarrier(&g_stCPUThdBarrier, 0))
 				{
-					GRS_THROW_IF_FAILED(pThdPms->pICmdList->Close());
-					::SetEvent(pThdPms->hEventRenderOver); // 设置信号，通知主线程本线程渲染完毕
+					//GRS_PRINTF(_T("%s子线程【%d】：通知主线程完成第【%d】遍渲染\n"), pszPreSpace, pThdPms->nIndex, pThdPms->m_nPassNO);
 
+					SetEvent(g_hEventPassOver);
 				}
 			}
 			break;
